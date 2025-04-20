@@ -430,43 +430,97 @@ Responsibilities:
 3. Infer evaluation rubric themes (Ownership, Tradeoffs, Reasoning, Ambiguity, Communication) and communication tips from search results.
 4. Use `generate_knowledge_embeddings_and_save` on search results
 Output: JSON with `company`, `inferred_rubric` (theme, evidence, reference), `communication_tips`.
-HANDOFF: planner_agent
+**IMPORTANT**: After completing all other tasks and generating the JSON output, you MUST use the `handoff_to_planner_agent` tool to pass control to the Planner Agent for LeetCode problem curation. This is your final action.
 """
 
 planner_prompt = """
 Role: Planner Agent. Curate LeetCode problems, present insights.
 Responsibilities:
-1. Use resume, jd, and knowledge embeddings for context from vector DB
+1. Use resume, jd, and knowledge embeddings for context from vector DB (`retrieve_resume_embeddings_from_vector_db`, `retrieve_jd_embeddings_from_vector_db`, `retrieve_knowledge_embeddings_from_vector_db`).
 2. Use `company_leetcode_problem_retriever` for company-specific LeetCode problems.
-3. Format and include `inferred_rubric` and `communication_tips` from Knowledge Agent.
-4. Use `generate_rubric_embeddings_and_save` on rubric/tips text
-Output: `suggested_leetcode`, `company_insights_display`
-Strictly HANDOFF to question_agent for generating a relevant, open-ended, behavioral interview question after this
+3. Format and include `inferred_rubric` and `communication_tips` from Knowledge Agent's output.
+4. Use `generate_rubric_embeddings_and_save` on the combined rubric and tips text.
+Output: JSON containing `suggested_leetcode` (list of strings) and `company_insights_display` (formatted string including rubric and tips).
+**IMPORTANT**: After completing all tasks and generating the JSON output, you MUST use the `handoff_to_question_agent` tool to pass control to the Question Agent for generating a behavioral question. This is your final action.
 """
 
 question_prompt = """
-Role: Question Agent. Generate relevant, open-ended, behavioral interview questions for skill development
+Role: Question Agent. Generate relevant, open-ended, behavioral interview questions for skill development.
 Responsibilities:
-1. Use `retrieve_resume_embeddings_from_vector_db`, `retrieve_jd_embeddings_from_vector_db`, `retrieve_knowledge_embeddings_from_vector_db` for context (resume, JD, knowledge/rubric).
-2. Synthesize context.
-3. Generate one question tailored to the company, JD, resume, and inferred rubric.
-Output: JSON with `question`.
+1. Use `retrieve_resume_embeddings_from_vector_db`, `retrieve_jd_embeddings_from_vector_db`, `retrieve_knowledge_embeddings_from_vector_db`, and `retrieve_rubric_embeddings_from_vector_db` for context (resume, JD, knowledge, rubric/tips).
+2. Synthesize the retrieved context.
+3. Generate ONE relevant, open-ended, behavioral interview question tailored to the company, JD, resume, and inferred rubric/tips. The question should encourage the candidate to demonstrate skills mentioned in the rubric.
+Output: JSON with a single key `question` containing the generated question string.
+**IMPORTANT**: After generating the question and formatting the JSON output, you MUST use the `handoff_to_evaluation_agent` tool to pass control to the Evaluation Agent for recording the answer and providing feedback. This is your final action.
 """
 
 evaluation_prompt = """
 Role: EvaluationFeedbackAgent. Provide interview feedback.
-Inputs: `question`, `candidate_answer`, `company_tag`, `rubric_index_path`.
+Inputs: `question` (from Question Agent), `company_tag` (extracted earlier, likely from JD), `rubric_index_path` (constant: ./faiss/rubric_embeddings). (Note: `candidate_answer` is obtained via tool call within this agent's process)
 Responsibilities:
-1. Use `retrieve_rubric_embeddings_from_vector_db` for evaluation criteria using `question` and `company_tag`.
-2. Use `generate_ideal_answer` for the `question`.
-3. Use `rewrite_candidate_answer` for the `candidate_answer`.
-4. Use `critique_and_advise` using all inputs. Critique should cover strengths, weaknesses (STAR method, complexity), and improvements (use bullet points, bold key terms).
-Output: JSON with `ideal_answer`, `improved_answer`, `detailed_feedback`.
+1. **Call `record_and_transcribe_audio_combined` tool** to capture the candidate's spoken answer to the received `question`. Store the transcription result as `candidate_answer`. Ensure the duration is sufficient (e.g., 30 seconds or more).
+2. Use `retrieve_rubric_embeddings_from_vector_db` with the `question` and `company_tag` to fetch relevant evaluation criteria (rubric context).
+3. Use `generate_ideal_answer` tool with the `question` and `company_tag` to get a model answer.
+4. Use `rewrite_candidate_answer` tool with the `question` and the transcribed `candidate_answer` to get an improved version.
+5. Use `critique_and_advise` tool using all gathered inputs (`question`, `candidate_answer`, `ideal_answer`, `rubric_context`, `company_tag`). The critique should cover strengths, weaknesses (specifically mentioning STAR method structure if applicable, complexity analysis if relevant), and actionable improvements. Use bullet points and bold key terms in the feedback.
+Output: JSON with keys `ideal_answer`, `improved_answer`, `detailed_feedback`. This is the final output of the workflow.
 """
 
 
 # --- Agent Creation ---
 
+# Combined function for recording and transcribing (remains as a tool)
+@tool
+def record_and_transcribe_audio_combined(duration: int = 15, fs: int = 16000) -> str: # Increased default duration
+    """Records audio from the microphone for a specified duration and transcribes it using Google Cloud Speech-to-Text. This should be called by the evaluation agent to get the candidate's answer."""
+    print(f"🎙️ Recording audio for {duration} seconds... Speak now!")
+    audio_file = f"/tmp/interview_answer_{uuid.uuid4()}.wav"
+    try:
+        # Record audio
+        recording = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype='float32')
+        sd.wait()
+        # Convert to int16 and save
+        recording_int16 = np.int16(recording * 32767)
+        wav.write(audio_file, fs, recording_int16)
+        print("✅ Audio recorded.")
+
+        # Transcribe audio
+        print("Transcribing audio...")
+        client = speech.SpeechClient() # Assumes GOOGLE_APPLICATION_CREDENTIALS is set
+        with open(audio_file, "rb") as f:
+            content = f.read()
+        audio = speech.RecognitionAudio(content=content)
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=fs,
+            language_code="en-US",
+            enable_automatic_punctuation=True
+        )
+        response = client.recognize(config=config, audio=audio)
+        os.remove(audio_file) # Clean up temporary file
+
+        if not response.results:
+            print("Transcription failed: No speech detected.")
+            return "[No speech detected]"
+
+        transcript = " ".join([result.alternatives[0].transcript for result in response.results])
+        print(f"Transcription complete: {transcript}")
+        return transcript.strip()
+    except Exception as e:
+        if os.path.exists(audio_file):
+            os.remove(audio_file)
+        error_msg = f"Error during audio recording or transcription: {e}"
+        print(error_msg)
+        return error_msg
+
+
+# from langgraph.prebuilt import ToolNode
+# Note: The record_agent function itself is not a tool to be added to ToolNode directly.
+# It's a node in the graph. If you intended to make the combined recording/transcription
+# a tool callable by other agents, you would decorate record_and_transcribe_audio_combined
+# with @tool and add it to a ToolNode or agent's tool list.
+# The current setup uses record_agent as a custom node step.
+# record_agent_node = ToolNode([record_agent], name="record_agent") # This seems incorrect based on record_agent's async def signature and usage
 
 # Creating Agent Nodes
 preprocess_tools = [extract_text_with_ocr, generate_resume_embeddings_and_save, generate_jd_embeddings_and_save, create_handoff_tool(agent_name='knowledge_agent', description='Hand over to Knowledge Agent for web search, rubric inference and generating knowledge embeddings')]
@@ -494,7 +548,8 @@ planner_agent_node = create_react_agent(
     name='planner_agent'
 )
 
-question_tools = [retrieve_resume_embeddings_from_vector_db, retrieve_jd_embeddings_from_vector_db, retrieve_knowledge_embeddings_from_vector_db]
+question_tools = [retrieve_resume_embeddings_from_vector_db, retrieve_jd_embeddings_from_vector_db, retrieve_knowledge_embeddings_from_vector_db,
+                  create_handoff_tool(agent_name='evaluation_agent', description='Hand over to Evaluation Agent to record the candidate answer and provide feedback.')] # Added handoff tool
 question_agent_node = create_react_agent(
     gemini_model,
     question_tools,
@@ -502,7 +557,7 @@ question_agent_node = create_react_agent(
     name='question_agent'
 )
 
-evaluation_tools = [retrieve_resume_embeddings_from_vector_db, retrieve_jd_embeddings_from_vector_db, retrieve_rubric_embeddings_from_vector_db, generate_ideal_answer, rewrite_candidate_answer, critique_and_advise]
+evaluation_tools = [record_and_transcribe_audio_combined, retrieve_resume_embeddings_from_vector_db, retrieve_jd_embeddings_from_vector_db, retrieve_rubric_embeddings_from_vector_db, generate_ideal_answer, rewrite_candidate_answer, critique_and_advise] # Added recording tool
 evaluation_agent_node = create_react_agent(
     gemini_model,
     evaluation_tools,
@@ -511,7 +566,7 @@ evaluation_agent_node = create_react_agent(
 )
 
 workflow = create_swarm(
-    [preprocess_agent_node, knowledge_agent_node, planner_agent_node, question_agent_node],
+    [preprocess_agent_node, knowledge_agent_node, planner_agent_node, question_agent_node, evaluation_agent_node], # Removed record_agent_node
     default_active_agent='preprocess_agent'
 )
 
@@ -522,8 +577,16 @@ config = {"configurable": {"thread_id": 1}}
 turn_1 = graph.invoke(
     {"messages": [
         {
-            "role": "user", 
-            "content": "The file path to my resume and jd is ./Mandar_Burande_Resume.pdf and ./jd.txt. Give me a list of popular leetcode problems for this company. Based on my experience, skills and projects from my resume, suggest me relevant, open-ended, behavioral interview questions that will help me improve my skills for this company."
+            "role": "user",
+            # More detailed request aligning with agent responsibilities:
+            "content": """
+            Please initiate the interview preparation process using my resume at './Mandar_Burande_Resume.pdf' and the job description at './jd.txt'.
+            1.  First, extract text from both files, clean it, identify the company name from the JD, and generate embeddings for both, saving them to their respective FAISS indexes (resume, jd).
+            2.  Next, use the extracted company name and JD context to research company-specific interview insights (coding, behavioral, system design) using web search. Infer evaluation rubric themes and communication tips from the findings and save this knowledge to the knowledge FAISS index.
+            3.  Then, using context from the resume, JD, and gathered knowledge, retrieve relevant LeetCode problems for the identified company from the Excel sheet and generate embeddings for the inferred rubric/tips, saving them to the rubric FAISS index. Present the LeetCode list and the company insights/rubric.
+            4.  After that, generate ONE relevant, open-ended, behavioral interview question tailored to my resume, the JD, and the company's inferred rubric/tips.
+            5.  Finally, prompt me to answer the generated question, record my spoken answer using the audio tool, transcribe it, generate an ideal answer, rewrite my answer for improvement, and provide detailed feedback comparing my answer to the ideal one based on the rubric, including strengths, weaknesses, and actionable advice.
+            """
         }
     ]},
     config
